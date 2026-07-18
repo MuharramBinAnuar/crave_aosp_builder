@@ -1,0 +1,248 @@
+name: Build Evolution X for even
+
+on:
+  workflow_dispatch:
+    inputs:
+      BUILD_TYPE:
+        description: 'Build type'
+        required: true
+        default: 'userdebug'
+        type: choice
+        options:
+          - 'userdebug'
+          - 'eng'
+          - 'user'
+      BUILD_VARIANT:
+        description: 'Lunch target (leave empty for auto-detect)'
+        required: false
+        default: ''
+
+env:
+  MANIFEST_URL: https://github.com/Evolution-X/manifest
+  MANIFEST_BRANCH: bka
+  DEVICE_CODENAME: even
+  LOCAL_MANIFEST_URL: https://github.com/rjfahad/android_local_manifests
+  LOCAL_MANIFEST_BRANCH: master
+
+jobs:
+  build:
+    name: Build Evolution X for even
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Display system info
+        run: |
+          echo "=== CPU ==="
+          nproc
+          cat /proc/cpuinfo | grep "model name" | head -1
+          echo "=== Memory ==="
+          free -h
+          echo "=== Disk ==="
+          df -h /
+          echo "=== Kernel ==="
+          uname -a
+
+      - name: Check free disk space
+        run: |
+          available=$(df --output=avail / | tail -1)
+          available_gb=$((available / 1024 / 1024))
+          echo "Available disk space: ${available_gb}GB"
+          echo "DISK_GB=$available_gb" >> "$GITHUB_ENV"
+          if [ "$available_gb" -lt 50 ]; then
+            echo "WARNING: Less than 50GB free. AOSP Android 16 typically requires 40-60GB."
+            echo "The build may fail due to insufficient disk space."
+          fi
+
+      - name: Install Android build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            android-sdk-platform-23 \
+            bc \
+            bison \
+            build-essential \
+            ccache \
+            curl \
+            flex \
+            g++-multilib \
+            gcc-multilib \
+            git \
+            gnupg \
+            gperf \
+            imagemagick \
+            lib32ncurses5-dev \
+            lib32readline-dev \
+            lib32z1-dev \
+            libelf-dev \
+            liblz4-tool \
+            libncurses5 \
+            libncurses5-dev \
+            libsdl1.2-dev \
+            libssl-dev \
+            libxml2 \
+            libxml2-utils \
+            lzop \
+            pngcrush \
+            python3 \
+            python3-pip \
+            python-is-python3 \
+            rsync \
+            schedtool \
+            squashfs-tools \
+            tmux \
+            xsltproc \
+            zip \
+            zlib1g-dev \
+            jq \
+            attr \
+            patchelf \
+            || echo "Some packages failed to install"
+          sudo apt-get install -y git-lfs
+          sudo apt-get clean
+
+      - name: Set up Git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git config --global color.ui false
+
+      - name: Install repo
+        run: |
+          mkdir -p ~/bin
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Initialize repo
+        run: |
+          repo init -u $MANIFEST_URL -b $MANIFEST_BRANCH --git-lfs --depth=1
+
+      - name: Add local manifests
+        run: |
+          mkdir -p .repo/local_manifests
+          git clone $LOCAL_MANIFEST_URL --depth 1 -b $LOCAL_MANIFEST_BRANCH .repo/local_manifests
+          echo "=== Local Manifest Contents ==="
+          cat .repo/local_manifests/*.xml
+
+      - name: Check disk before sync
+        run: |
+          echo "=== Disk Before Sync ==="
+          df -h /
+
+      - name: Sync source
+        run: |
+          repo sync -c --force-sync --no-clone-bundle --no-tags -j$(nproc) 2>&1 | tee sync.log
+        timeout-minutes: 180
+
+      - name: Verify device tree directories
+        run: |
+          echo "=== Verifying device tree paths ==="
+          for path in device/realme/even vendor/realme/even kernel/realme/even; do
+            if [ -d "$path" ]; then
+              echo "✅ $path exists"
+              ls "$path/" | head -10
+            else
+              echo "❌ $path MISSING!"
+            fi
+          done
+
+      - name: Detect lunch target
+        id: lunch
+        run: |
+          # Try to detect from AndroidProducts.mk in device tree
+          if [ -f device/realme/even/AndroidProducts.mk ]; then
+            # Get the makefile name from AndroidProducts.mk
+            makefile=$(grep -oP 'LOCAL_DIR\)/\K[^)]+' device/realme/even/AndroidProducts.mk | head -1)
+            if [ -n "$makefile" ]; then
+              # Extract product name from the makefile
+              product_name=$(grep -oP '^PRODUCT_NAME\s*:=\s*\K\S+' "device/realme/even/$makefile" | head -1)
+              if [ -n "$product_name" ]; then
+                echo "Detected product: $product_name"
+                echo "target=${product_name}-${{ inputs.BUILD_TYPE || 'userdebug' }}" >> "$GITHUB_OUTPUT"
+              fi
+            fi
+          fi
+          # Fallback to vendorsetup.sh
+          if [ -z "${{ steps.lunch.outputs.target }}" ] && [ -f device/realme/even/vendorsetup.sh ]; then
+            combo=$(grep add_lunch_combo device/realme/even/vendorsetup.sh | head -1 | awk '{print $2}')
+            if [ -n "$combo" ]; then
+              echo "Detected from vendorsetup.sh: $combo"
+              echo "target=$combo" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+          # Final fallback
+          if [ -z "${{ steps.lunch.outputs.target }}" ]; then
+            echo "WARNING: Could not detect lunch target. Using evolution_even-userdebug"
+            echo "target=evolution_even-${{ inputs.BUILD_TYPE || 'userdebug' }}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Lunch target: ${{ steps.lunch.outputs.target }}"
+
+      - name: Check disk before build
+        run: |
+          echo "=== Disk Before Build ==="
+          df -h /
+
+      - name: Set up build environment and lunch
+        run: |
+          source build/envsetup.sh
+          lunch ${{ steps.lunch.outputs.target }}
+        timeout-minutes: 5
+
+      - name: Build Evolution X
+        run: |
+          source build/envsetup.sh
+          lunch ${{ steps.lunch.outputs.target }}
+          m evolution 2>&1 | tee build.log
+        timeout-minutes: 300
+        continue-on-error: true
+
+      - name: Save build log
+        if: always()
+        run: |
+          if [ -f build.log ]; then
+            gzip -9 build.log
+            mv build.log.gz build-log.gz
+          fi
+          if [ -f sync.log ]; then
+            gzip -9 sync.log
+            mv sync.log.gz sync-log.gz
+          fi
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            build-log.gz
+            sync-log.gz
+            out/error.log
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload ROM ZIP
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evolution-x-even
+          path: out/target/product/even/*.zip
+          retention-days: 30
+
+      - name: Upload recovery image
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovery-img
+          path: out/target/product/even/*.img
+          retention-days: 30
+
+      - name: Print disk usage summary
+        if: always()
+        run: |
+          echo "=== Final Disk Usage ==="
+          df -h /
+          du -sh .repo 2>/dev/null || echo ".repo not found"
+          du -sh out 2>/dev/null || echo "out not found"
